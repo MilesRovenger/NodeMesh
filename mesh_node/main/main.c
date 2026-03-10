@@ -42,6 +42,26 @@ static void on_mesh_recv(const mesh_packet_t *packet)
 }
 
 /**
+ * @brief Callback for message delivery status.
+ * 
+ * @param msg_id The ID of the message.
+ * @param dst_mac The destination MAC address.
+ * @param result The result of the delivery attempt.
+ */
+static void on_delivery(uint16_t msg_id, const uint8_t dst_mac[6],
+                        bool result)
+{
+    // success
+    if (result) {
+        ESP_LOGI(TAG, "DELIVERED id=%u to " FMTMAC, msg_id, ARGMAC(dst_mac));
+    }
+    // failure 
+    else {
+        ESP_LOGW(TAG, "FAILED id=%u to " FMTMAC, msg_id, ARGMAC(dst_mac));
+    }
+}
+
+/**
  * @brief Resolve a MAC address suffix to a full MAC address. Uses the routing table to find a matching destination MAC.
  * linear scan is fine since the routing table is small and this is only used for user input commands.
  * 
@@ -278,6 +298,8 @@ void app_main(void)
     mesh_protocol_init();
     // Set our callback for when we recieve a mesh message, this will be called from the mesh_protocol on_mesh_recv function when a message is received and identified as a user payload (not a HELLO or ROUTE_UPDATE)
     mesh_set_recv_callback(on_mesh_recv);
+    // Set our callback for delivery status updates, this will be called from the mesh_protocol on_data_sent callback when an ACK is received or when a unicast message fails to deliver after max retries
+    mesh_set_delivery_callback(on_delivery);
 
     if (oled_init() != ESP_OK) {
         ESP_LOGW(TAG, "OLED not found, continuing without display");

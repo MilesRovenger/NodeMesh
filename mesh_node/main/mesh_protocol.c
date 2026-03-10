@@ -11,31 +11,48 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char *TAG = "mesh_protocol";
 
 #define FMTMAC "%02x:%02x:%02x:%02x:%02x:%02x"
-#define ARGMAC(m) (m)[0],(m)[1],(m)[2],(m)[3],(m)[4],(m)[5]
+#define ARGMAC(m) (m)[0], (m)[1], (m)[2], (m)[3], (m)[4], (m)[5]
+#define ACK_CHECK_INTERVAL_MS 100 // how often we check for timed-out ACKs
 
 #define HELLO_INTERVAL_MS 5000
-#define ROUTE_UPDATE_INTERVAL_MS 8000   // advertise our routing table every 8s
+#define ROUTE_UPDATE_INTERVAL_MS 8000 // advertise our routing table every 8s
+
+// Pending ACK table for tracking unicast message deliveries and retransmissions
+static pending_ack_entry_t pending[PENDING_ACK_TABLE_SIZE];
+
+// Mutex to protect access to the pending ACK table
+static SemaphoreHandle_t pending_mutex = NULL;
 
 // Our own MAC address, 6 bytes as a mac address is 6 bytes
 static uint8_t self_mac[6];
 
-// Counter to prevent duplicate message IDs. In a real implementation, 
-//this should probably be randomised and persisted across reboots to avoid collisions, 
+// Counter to prevent duplicate message IDs. In a real implementation,
+// this should probably be randomised and persisted across reboots to avoid collisions,
 // but for this simple example it's just a counter.
 static uint16_t msg_id_counter = 0;
 
 // Function pointer for application receive callback, set by main.c
 static mesh_recv_cb_t recv_cb = NULL;
 
+// Function pointer for delivery status callback, set by main.c
+static mesh_delivery_cb_t delivery_cb = NULL;
+
 static const uint8_t BROADCAST_MAC[6] = MESH_BROADCAST_ADDR;
+
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
 
 /**
  * @brief Register the broadcast peer for ESP-NOW communication.
- * 
+ * This allows us to send broadcast messages to all nodes in the mesh network.
+ *
  */
 static void register_broadcast_peer(void)
 {
@@ -45,20 +62,22 @@ static void register_broadcast_peer(void)
     peer.encrypt = false;
 
     esp_err_t ret = esp_now_add_peer(&peer);
-    if (ret != ESP_ERR_ESPNOW_EXIST) {
+    if (ret != ESP_ERR_ESPNOW_EXIST)
+    {
         ESP_ERROR_CHECK(ret);
     }
 }
 
 /**
  * @brief Ensure a unicast peer is registered for ESP-NOW communication.
- * 
+ *
  * @param mac The MAC address of the peer to register.
- * 
+ *
  */
 static void ensure_unicast_peer(const uint8_t mac[6])
 {
-    if (esp_now_is_peer_exist(mac)) return;
+    if (esp_now_is_peer_exist(mac))
+        return;
 
     esp_now_peer_info_t peer = {0};
     memcpy(peer.peer_addr, mac, 6);
@@ -66,17 +85,163 @@ static void ensure_unicast_peer(const uint8_t mac[6])
     peer.encrypt = false;
 
     esp_err_t ret = esp_now_add_peer(&peer);
-    if (ret != ESP_OK && ret != ESP_ERR_ESPNOW_EXIST) {
+    if (ret != ESP_OK && ret != ESP_ERR_ESPNOW_EXIST)
+    {
         ESP_LOGW(TAG, "failed to add unicast peer: %s", esp_err_to_name(ret));
     }
 }
 
+static void ack_retry_task(void *arg)
+{
+    while (true)
+    {
+        vTaskDelay(pdMS_TO_TICKS(ACK_CHECK_INTERVAL_MS));
+
+        uint32_t now = now_ms();
+
+        xSemaphoreTake(pending_mutex, portMAX_DELAY);
+
+        for (int i = 0; i < PENDING_ACK_TABLE_SIZE; i++)
+        {
+            if (!pending[i].active)
+                continue;
+
+            uint32_t age = now - pending[i].sent_at_ms;
+            if (age < ACK_TIMEOUT_MS)
+                continue;
+
+            // This packet has timed out waiting for an ACK
+            if (pending[i].attempts >= ACK_MAX_ATTEMPTS)
+            {
+                // Give up
+                ESP_LOGW(TAG, "delivery FAILED for id=%u to " FMTMAC " after %u attempts",
+                         pending[i].packet.msg_id,
+                         ARGMAC(pending[i].packet.dst_mac),
+                         pending[i].attempts);
+
+                // failed
+                if (delivery_cb)
+                {
+                    delivery_cb(pending[i].packet.msg_id,
+                                pending[i].packet.dst_mac,
+                                false);
+                }
+                pending[i].active = false;
+            }
+            else
+            {
+                // Retransmit
+                pending[i].attempts++;
+                pending[i].sent_at_ms = now;
+
+                ESP_LOGI(TAG, "retransmitting id=%u to " FMTMAC " (attempt %u/%u)",
+                         pending[i].packet.msg_id,
+                         ARGMAC(pending[i].packet.dst_mac),
+                         pending[i].attempts,
+                         ACK_MAX_ATTEMPTS);
+
+                esp_now_send(pending[i].next_hop,
+                             (uint8_t *)&pending[i].packet,
+                             MESH_HEADER_SIZE + pending[i].packet.payload_len);
+            }
+        }
+
+        xSemaphoreGive(pending_mutex);
+    }
+}
+
 /**
- * @brief Build and broadcast our routing table to neighbors.
- * applies split horizon by excluding routes learned from the neighbor we're sending to.
- * Called periodically in route_update_task, and also on startup after a delay to let neighbors be discovered.
- * this prevents routing loops in distance-vector networks.
- * 
+ * @brief Send an acknowledgment (ACK) for a received message back to sender.
+ *
+ * @param dst_mac The MAC address of the node to send the ACK to.
+ * @param ack_msg_id The message ID of the received message being acknowledged.
+ */
+static void send_ack(const uint8_t dst_mac[6], uint16_t ack_msg_id)
+{
+    ensure_unicast_peer(dst_mac);
+
+    mesh_packet_t ack = {0};
+    memcpy(ack.src_mac, self_mac, 6);
+    memcpy(ack.dst_mac, dst_mac, 6);
+    ack.msg_id = ack_msg_id; // echo back the original msg_id
+    ack.ttl = 1;             // ACKs go directly, no relay
+    ack.msg_type = MSG_TYPE_ACK;
+    ack.payload_len = 0;
+
+    esp_err_t ret = esp_now_send(dst_mac, (uint8_t *)&ack, MESH_HEADER_SIZE);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "ACK send failed: %s", esp_err_to_name(ret));
+    }
+    else
+    {
+        ESP_LOGD(TAG, "sent ACK for id=%u to " FMTMAC, ack_msg_id, ARGMAC(dst_mac));
+    }
+}
+
+/**
+ * @brief Add a packet to the pending ACK table for tracking unicast message deliveries and retransmissions.
+ *
+ * @param packet The mesh packet to be added.
+ * @param next_hop The resolved next hop MAC address for the packet.
+ */
+static void pending_add(const mesh_packet_t *packet, const uint8_t next_hop[6])
+{
+    xSemaphoreTake(pending_mutex, portMAX_DELAY);
+
+    for (int i = 0; i < PENDING_ACK_TABLE_SIZE; i++)
+    {
+        if (!pending[i].active)
+        {
+            pending[i].packet = *packet;
+            memcpy(pending[i].next_hop, next_hop, 6);
+            pending[i].sent_at_ms = now_ms();
+            pending[i].attempts = 1;
+            pending[i].active = true;
+            break;
+        }
+    }
+
+    xSemaphoreGive(pending_mutex);
+}
+
+/**
+ * @brief Handle the receipt of an ACK for a pending unicast message.
+ *
+ * @param msg_id The message ID of the ACKed packet.
+ * @param src_mac The MAC address of the node that sent the ACK.
+ */
+static void pending_ack_received(uint16_t msg_id, const uint8_t src_mac[6])
+{
+    xSemaphoreTake(pending_mutex, portMAX_DELAY);
+
+    for (int i = 0; i < PENDING_ACK_TABLE_SIZE; i++)
+    {
+        if (pending[i].active && pending[i].packet.msg_id == msg_id && memcmp(pending[i].packet.dst_mac, src_mac, 6) == 0)
+        {
+
+            ESP_LOGI(TAG, "ACK received for id=%u to " FMTMAC " (%u attempt(s))",
+                     msg_id, ARGMAC(src_mac), pending[i].attempts);
+
+            pending[i].active = false;
+
+            if (delivery_cb)
+            {
+                delivery_cb(msg_id, src_mac, true);
+            }
+            break;
+        }
+    }
+
+    xSemaphoreGive(pending_mutex);
+}
+
+/**
+ * @brief Build and broadcast our routing table to neighbors. applies
+ * split horizon by excluding routes learned from the neighbor we're sending to.
+ * Called periodically in route_update_task, and also on startup after a delay
+ * to let neighbors be discovered. this prevents routing loops in distance-vector networks.
+ *
  */
 static void send_route_update(void)
 {
@@ -95,7 +260,8 @@ static void send_route_update(void)
     n++;
 
     // All known routes
-    for (int i = 0; i < count && n < (int)MESH_MAX_ROUTE_ENTRIES; i++) {
+    for (int i = 0; i < count && n < (int)MESH_MAX_ROUTE_ENTRIES; i++)
+    {
         memcpy(entries[n].dst_mac, routes[i].dst_mac, 6);
         entries[n].hop_count = routes[i].hop_count;
         n++;
@@ -106,45 +272,52 @@ static void send_route_update(void)
     mesh_packet_t packet = {0};
     memcpy(packet.src_mac, self_mac, 6);
     memset(packet.dst_mac, 0xFF, 6);
-    packet.msg_id      = msg_id_counter++;
-    packet.ttl         = 2;   // route updates only need to reach direct neighbors
-    packet.msg_type    = MSG_TYPE_ROUTE_UPDATE;
+    packet.msg_id = msg_id_counter++;
+    packet.ttl = 2; // route updates only need to reach direct neighbors
+    packet.msg_type = MSG_TYPE_ROUTE_UPDATE;
     packet.payload_len = payload_len;
     memcpy(packet.payload, entries, payload_len);
 
     int send_len = MESH_HEADER_SIZE + payload_len;
     esp_err_t ret = esp_now_send(BROADCAST_MAC, (uint8_t *)&packet, send_len);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         ESP_LOGW(TAG, "route update send failed: %s", esp_err_to_name(ret));
-    } else {
+    }
+    else
+    {
         ESP_LOGD(TAG, "TX route update with %d entries", n);
     }
 }
 
 /**
  * @brief Handle an incoming route update packet.
- * 
+ *
  * @param packet The received mesh packet containing route updates.
  */
 static void handle_route_update(const mesh_packet_t *packet)
 {
     int entry_count = packet->payload_len / sizeof(mesh_route_entry_t);
-    if (entry_count == 0) return;
+    if (entry_count == 0)
+        return;
 
     const mesh_route_entry_t *entries = (const mesh_route_entry_t *)packet->payload;
 
-    for (int i = 0; i < entry_count; i++) {
+    for (int i = 0; i < entry_count; i++)
+    {
         const mesh_route_entry_t *e = &entries[i];
 
         // Don't add a route to ourselves
-        if (memcmp(e->dst_mac, self_mac, 6) == 0) continue;
+        if (memcmp(e->dst_mac, self_mac, 6) == 0)
+            continue;
 
         // Split horizon: don't accept a route if the next hop IS
         // the node we'd be routing through, that's a loop.
         // (We learned this route from packet->src_mac, so if the
         // destination IS packet->src_mac, skip it,  we already know
         // how to reach them directly.)
-        if (memcmp(e->dst_mac, packet->src_mac, 6) == 0) {
+        if (memcmp(e->dst_mac, packet->src_mac, 6) == 0)
+        {
             // Direct neighbor — always 1 hop via themselves
             routing_table_update(e->dst_mac, packet->src_mac, 1);
             continue;
@@ -158,7 +331,7 @@ static void handle_route_update(const mesh_packet_t *packet)
 
 /**
  * @brief Callback for ESP-NOW data sent events. Logs the status of the transmission.
- * 
+ *
  * @param tx_info Information about the transmitted data.
  * @param status Status of the transmission.
  */
@@ -170,7 +343,7 @@ static void on_data_sent(const wifi_tx_info_t *tx_info, esp_now_send_status_t st
 
 /**
  * @brief Callback for ESP-NOW data received events. Processes incoming mesh packets.
- * 
+ *
  * @param recv_info Information about the received data.
  * @param data Pointer to the received data.
  * @param data_len Length of the received data.
@@ -178,7 +351,8 @@ static void on_data_sent(const wifi_tx_info_t *tx_info, esp_now_send_status_t st
 static void on_data_recv(const esp_now_recv_info_t *recv_info,
                          const uint8_t *data, int data_len)
 {
-    if (data_len < (int)MESH_HEADER_SIZE) {
+    if (data_len < (int)MESH_HEADER_SIZE)
+    {
         ESP_LOGW(TAG, "undersized frame (%d bytes), dropping", data_len);
         return;
     }
@@ -186,44 +360,61 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info,
     const mesh_packet_t *packet = (const mesh_packet_t *)data;
 
     // Drop our own transmissions
-    if (memcmp(packet->src_mac, self_mac, 6) == 0) return;
+    if (memcmp(packet->src_mac, self_mac, 6) == 0)
+        return;
 
     // Update neighbor table for the sender
     neighbor_table_update(packet->src_mac, recv_info->rx_ctrl->rssi);
 
+    // ACKs bypass dedup — must always be processed
+    if (packet->msg_type == MSG_TYPE_ACK)
+    {
+        pending_ack_received(packet->msg_id, packet->src_mac);
+        return;
+    }
+
     // Deduplication
-    if (dedup_cache_is_duplicate(packet->src_mac, packet->msg_id)) {
+    if (dedup_cache_is_duplicate(packet->src_mac, packet->msg_id))
+    {
         ESP_LOGD(TAG, "duplicate packet id=%u, dropping", packet->msg_id);
         return;
     }
 
     // Dispatch by message type
-    if (packet->msg_type == MSG_TYPE_HELLO) {
+    if (packet->msg_type == MSG_TYPE_HELLO)
+    {
         ESP_LOGI(TAG, "HELLO from " FMTMAC " (rssi=%d dBm)",
                  ARGMAC(packet->src_mac), recv_info->rx_ctrl->rssi);
         // HELLO packets flood normally so far-away nodes discover
         // each other through relays, but don't go to app layer.
-
-    } else if (packet->msg_type == MSG_TYPE_ROUTE_UPDATE) {
+    }
+    else if (packet->msg_type == MSG_TYPE_ROUTE_UPDATE)
+    {
         handle_route_update(packet);
         // Route updates flood to TTL=2 (set at send time), handled below.
-
-    } else if (packet->msg_type == MSG_TYPE_UNICAST) {
+    }
+    else if (packet->msg_type == MSG_TYPE_UNICAST)
+    {
         // Is this packet addressed to us?
-        if (memcmp(packet->dst_mac, self_mac, 6) == 0) {
+        if (memcmp(packet->dst_mac, self_mac, 6) == 0)
+        {
             ESP_LOGI(TAG, "UNICAST RX id=%u from " FMTMAC,
                      packet->msg_id, ARGMAC(packet->src_mac));
-            if (recv_cb) recv_cb(packet);
-            return;  // don't forward packets addressed to us
+            if (recv_cb)
+                recv_cb(packet);
+            send_ack(packet->src_mac, packet->msg_id);
+            return;
         }
 
         // Not for us — forward toward destination using routing table
         uint8_t next_hop[6];
-        if (routing_table_lookup(packet->dst_mac, next_hop)) {
+        if (routing_table_lookup(packet->dst_mac, next_hop))
+        {
             ensure_unicast_peer(next_hop);
             mesh_packet_t fwd = *packet;
             fwd.ttl--;
-            if (fwd.ttl == 0) {
+            if (fwd.ttl == 0)
+            {
                 ESP_LOGW(TAG, "unicast TTL exhausted, dropping");
                 return;
             }
@@ -231,28 +422,34 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info,
             esp_now_send(next_hop, (uint8_t *)&fwd, send_len);
             ESP_LOGD(TAG, "forwarded unicast toward " FMTMAC " via " FMTMAC,
                      ARGMAC(packet->dst_mac), ARGMAC(next_hop));
-        } else {
+        }
+        else
+        {
             ESP_LOGW(TAG, "no route to " FMTMAC ", dropping unicast",
                      ARGMAC(packet->dst_mac));
         }
-        return;  // unicast never floods
-
-    } else {
+        return; // unicast never floods
+    }
+    else
+    {
         // MSG_TYPE_DATA — broadcast data, deliver to app layer
         ESP_LOGI(TAG, "RX id=%u ttl=%u len=%u from " FMTMAC " (rssi=%d dBm)",
                  packet->msg_id, packet->ttl, packet->payload_len,
                  ARGMAC(packet->src_mac), recv_info->rx_ctrl->rssi);
-        if (recv_cb) recv_cb(packet);
+        if (recv_cb)
+            recv_cb(packet);
     }
 
     // Flooding relay for broadcast packet types
     // (DATA, HELLO, ROUTE_UPDATE — not UNICAST)
-    if (packet->ttl > 1) {
+    if (packet->ttl > 1)
+    {
         mesh_packet_t relay = *packet;
         relay.ttl--;
         int send_len = MESH_HEADER_SIZE + relay.payload_len;
         esp_err_t ret = esp_now_send(BROADCAST_MAC, (uint8_t *)&relay, send_len);
-        if (ret != ESP_OK) {
+        if (ret != ESP_OK)
+        {
             ESP_LOGW(TAG, "relay failed: %s", esp_err_to_name(ret));
         }
     }
@@ -260,12 +457,13 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info,
 
 /**
  * @brief Task to periodically broadcast a HELLO message to announce our presence to neighbors.
- * 
+ *
  * @param arg Unused.
  */
 static void hello_task(void *arg)
 {
-    while(true) {
+    while (true)
+    {
         mesh_packet_t packet = {0};
         memcpy(packet.src_mac, self_mac, 6);
         memset(packet.dst_mac, 0xFF, 6);
@@ -280,14 +478,15 @@ static void hello_task(void *arg)
 
 /**
  * @brief Task to periodically broadcast route updates to neighbors.
- * 
+ *
  * @param arg Unused.
  */
 static void route_update_task(void *arg)
 {
     // Wait a bit on startup so we have neighbors before advertising
     vTaskDelay(pdMS_TO_TICKS(3000));
-    while(true) {
+    while (true)
+    {
         send_route_update();
         routing_table_expire();
         vTaskDelay(pdMS_TO_TICKS(ROUTE_UPDATE_INTERVAL_MS));
@@ -323,15 +522,25 @@ void mesh_protocol_init(void)
     neighbor_table_init();
     routing_table_init();
 
-    xTaskCreate(hello_task, "hello", 2048, NULL, 4, NULL);
-    xTaskCreate(route_update_task, "route_update", 4096, NULL, 4, NULL);
+    // init pending ACK table and mutex
+    memset(pending, 0, sizeof(pending));
+    pending_mutex = xSemaphoreCreateMutex();
+    configASSERT(pending_mutex != NULL);
+
+    // Start tasks for HELLO messages, route updates, and ACK retries
+    xTaskCreate(hello_task, "hello", 2048, NULL, 1, NULL);
+    // Start task to periodically send route updates to neighbors, also calls routing_table_expire to remove stale routes before sending updates
+    xTaskCreate(route_update_task, "route_update", 4096, NULL, 1, NULL);
+    // Start task to check for ACK timeouts and handle retransmissions for unicast messages
+    xTaskCreate(ack_retry_task, "ack_retry", 2048, NULL, 1, NULL);
 
     ESP_LOGI(TAG, "mesh_protocol ready");
 }
 
 esp_err_t mesh_send_broadcast(const uint8_t *data, uint8_t data_len)
 {
-    if (data_len > MESH_PAYLOAD_MAX) return ESP_ERR_INVALID_ARG;
+    if (data_len > MESH_PAYLOAD_MAX)
+        return ESP_ERR_INVALID_ARG;
 
     mesh_packet_t packet = {0};
     // Copy MAC address (6 bytes)
@@ -351,12 +560,14 @@ esp_err_t mesh_send_broadcast(const uint8_t *data, uint8_t data_len)
 esp_err_t mesh_send_unicast(const uint8_t dst_mac[6],
                             const uint8_t *data, uint8_t data_len)
 {
-    if (data_len > MESH_PAYLOAD_MAX) return ESP_ERR_INVALID_ARG;
+    if (data_len > MESH_PAYLOAD_MAX)
+        return ESP_ERR_INVALID_ARG;
 
-    // Look up next hop from routing table as we don't send data directly to the destination, 
+    // Look up next hop from routing table as we don't send data directly to the destination,
     // we send to the next hop toward the destination.
     uint8_t next_hop[6];
-    if (!routing_table_lookup(dst_mac, next_hop)) {
+    if (!routing_table_lookup(dst_mac, next_hop))
+    {
         ESP_LOGW(TAG, "no route to " FMTMAC, ARGMAC(dst_mac));
         return ESP_ERR_NOT_FOUND;
     }
@@ -375,10 +586,20 @@ esp_err_t mesh_send_unicast(const uint8_t dst_mac[6],
     ESP_LOGI(TAG, "TX unicast to " FMTMAC " via " FMTMAC " id=%u",
              ARGMAC(dst_mac), ARGMAC(next_hop), packet.msg_id);
 
-    return esp_now_send(next_hop, (uint8_t *)&packet, MESH_HEADER_SIZE + data_len);
+    esp_err_t err = esp_now_send(next_hop, (uint8_t *)&packet, MESH_HEADER_SIZE + data_len);
+    if (err == ESP_OK)
+    {
+        pending_add(&packet, next_hop);
+    }
+    return err;
 }
 
 void mesh_set_recv_callback(mesh_recv_cb_t cb)
 {
     recv_cb = cb;
+}
+
+void mesh_set_delivery_callback(mesh_delivery_cb_t cb)
+{
+    delivery_cb = cb;
 }
