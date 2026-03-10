@@ -1,0 +1,42 @@
+{
+  "configurations": [
+    {
+      "name": "ESP-IDF",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "${env:IDF_PATH}/components/**",
+        "${env:IDF_PATH}/components/freertos/FreeRTOS-Kernel/include/**",
+        "${env:IDF_PATH}/components/freertos/esp_additions/include/**",
+        "${env:IDF_PATH}/components/esp_common/include/**",
+        "${env:IDF_PATH}/components/esp_wifi/include/**",
+        "${env:IDF_PATH}/components/esp_event/include/**",
+        "${env:IDF_PATH}/components/esp_netif/include/**",
+        "${env:IDF_PATH}/components/esp_now/include/**",
+        "${env:IDF_PATH}/components/nvs_flash/include/**",
+        "${env:IDF_PATH}/components/log/include/**",
+        "${env:IDF_PATH}/components/esp_hw_support/include/**",
+        "${env:IDF_PATH}/components/esp_system/include/**",
+        "${env:IDF_PATH}/components/hal/include/**",
+        "${env:IDF_PATH}/components/soc/esp32/include/**",
+        "${workspaceFolder}/build/config"
+      ],
+      "defines": [
+        "ESP_PLATFORM",
+        "IDF_VER=\"v5.0\"",
+        "CONFIG_IDF_TARGET_ESP32=1"
+      ],
+      "compilerPath": "C:\\Espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20251107\\xtensa-esp-elf\\bin\\xtensa-esp32-elf-gcc.exe",
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "gcc-x64",
+      "browse": {
+        "path": [
+          "${workspaceFolder}",
+          "${env:IDF_PATH}/components"
+        ],
+        "limitSymbolsToIncludedHeaders": false
+      }
+    }
+  ],
+  "version": 4
+}
