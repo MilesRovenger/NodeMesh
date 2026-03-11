@@ -311,6 +311,4 @@ void app_main(void)
     xTaskCreate(display_task, "display", 4096, NULL, 1, NULL);
     // Creates task to print neighbor and routing tables every 30s for visualization of mesh topology, also calls neighbor_table_expire to remove stale neighbors before printing
     xTaskCreate(topology_task, "topology", 4096, NULL, 1, NULL);
-
-    ESP_LOGI(TAG, "Stage 6 running — type 'nodes' in monitor to see topology");
 }
