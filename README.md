@@ -77,7 +77,6 @@ Imagine a situation where three nodes are all close enough to each other to wher
 
 The route starts at 2 hops:
 ![Route starts at 2 hops](readme_images/2_hop_start.png)
-
 Route is later improved after route update is broadcasted:
 ![Improving a route](readme_images/improving_route.png)
 ![Routing table](readme_images/routing_table.png)
