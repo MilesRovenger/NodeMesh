@@ -76,8 +76,11 @@ Nodes periodically broadcast their routing tables to neighbors via HELLO beacons
 Imagine a situation where three nodes are all close enough to each other to where each can transmit data to each other via 1 hop. Node 1 connects to node 2 first via 1 hop, node 3 connects to node 1 via 1 hop, but gets its routing data for node 2 via node 1, thereby believing it can only access node 2 via node 1 with 2 hops. Nodes periodically broadcast their routing tables to neighbors via route update packets and can update their routes accordingly.
 
 The route starts at 2 hops:
+
 ![Route starts at 2 hops](readme_images/2_hop_start.png)
+
 Route is later improved after route update is broadcasted:
+
 ![Improving a route](readme_images/improving_route.png)
 ![Routing table](readme_images/routing_table.png)
 
