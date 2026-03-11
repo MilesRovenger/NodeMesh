@@ -6,7 +6,7 @@ A simple custom mesh networking stack built from scratch in C on ESP32 using ESP
 
 ## Demo
 
-![Alt text](readme_images/image.png)
+![Three meshes connected](readme_images/three.png)
 
 ---
 
@@ -24,7 +24,7 @@ ESP32 G21  →  OLED SDA
 ESP32 G22  →  OLED SCL
 ```
 
-img of one up close
+![Single OLED wiring](readme_images/single.png)
 
 ---
 
@@ -57,8 +57,7 @@ typedef struct __attribute__((packed)) {
 } mesh_packet_t;
 ```
 
-`__attribute__((packed))` prevents compiler padding so the byte layout is identical across all nodes. A packet is simply a collection of raw bytes that we can send between devices and have
-them our 
+`__attribute__((packed))` prevents compiler padding so the byte layout is identical across all nodes. A packet is simply a collection of raw bytes that we can send between devices and are unpacked and turned into usable data by 
 
 ---
 
@@ -67,10 +66,21 @@ them our
 ### Neighbor Discovery
 Each node broadcasts a `HELLO` beacon every 5 seconds. Every node that receives one records the sender's MAC and RSSI in a neighbor table. Entries expire after 15 seconds of silence.
 
-![OLED showing neighbor table](readme_images/oled_neighbors.jpg)
+![New neighbor discovered](readme_images/new_neighbor.png)
 
 ### Distance-Vector Routing
-Nodes periodically broadcast their routing tables to neighbors. Each node applies the Bellman-Ford update rule — if a neighbor can reach destination X in N hops, this node can reach X in N+1 hops via that neighbor. Split horizon prevents count-to-infinity loops by never advertising a route back to the neighbor it was learned from.
+Nodes periodically broadcast their routing tables to neighbors via HELLO beacons. When we recieve a HELLO, the node applies the Bellman-Ford update rule to find its distance and route from the node, if a neighbor can reach destination X in N hops, this node can reach X in N+1 hops via that neighbor. Split horizon prevents count-to-infinity loops by never advertising a route back to the neighbor it was learned from.
+
+### Routing Improvements
+
+Imagine a situation where three nodes are all close enough to each other to where each can transmit data to each other via 1 hop. Node 1 connects to node 2 first via 1 hop, node 3 connects to node 1 via 1 hop, but gets its routing data for node 2 via node 1, thereby believing it can only access node 2 via node 1 with 2 hops. Nodes periodically broadcast their routing tables to neighbors via route update packets and can update their routes accordingly.
+
+The route starts at 2 hops:
+![Route starts at 2 hops](readme_images/2_hop_start.png)
+
+Route is later improved after route update is broadcasted:
+![Improving a route](readme_images/improving_route.png)
+![Routing table](readme_images/routing_table.png)
 
 ### Flooding with Deduplication
 Broadcast packets are flooded — every node rebroadcasts every packet it receives. A fixed-size ring buffer tracks `(src_mac, msg_id)` pairs and drops duplicates. TTL limits the maximum hop count.
@@ -78,7 +88,7 @@ Broadcast packets are flooded — every node rebroadcasts every packet it receiv
 ### Unicast Routing
 `mesh_send_unicast()` looks up the next hop in the routing table and sends directly to that neighbor. The neighbor repeats the lookup and forwards toward the destination. Packets are never broadcast — each takes a single directed path.
 
-![Serial monitor showing unicast TX and ACK](photos/unicast_ack.jpg)
+![Unicast message send](readme_images/hello_neighbor.png)
 
 ### ACK and Retransmission
 Every unicast packet is tracked in a pending ACK table. The destination node sends an ACK immediately on receipt. If no ACK arrives within 500ms, the sender retransmits up to 3 times. After 3 failed attempts a delivery failure callback fires.
@@ -98,10 +108,6 @@ FAILED id=12 to e8:76:64
 
 ---
 
-## Monitoring startup connections
-
-
-
 ## Serial Console
 
 Each node exposes a command interface over UART. Connect via the ESP-IDF monitor and type:
@@ -118,49 +124,6 @@ b hello everyone
 
 u e8:76:64 hey you specifically
 
-
-<!-- Take a photo or screenshot of the serial monitor with commands being typed and replace this line -->
-![Serial console in use](photos/serial_console.jpg)
-
----
-
-## OLED Display
-
-Each node displays live network state:
-
-```
-  MESH NODE
-MAC:cb:d8:e8
-
-NGHBR:2  ROUTES:2
-e8:76:64  -32dBm
-6a:65:8c  -44dBm
-RX: hello everyone
-   70:4b:ca
-```
-
-<!-- Take a photo of all three OLEDs side by side and replace this line -->
-![Three OLEDs displaying mesh state](photos/three_oleds.jpg)
-
----
-
-## Build and Flash
-
-Requires ESP-IDF v5.5+.
-
-```bash
-# Set target
-idf.py set-target esp32
-
-# Build
-idf.py build
-
-# Flash and monitor
-idf.py -p COM3 flash monitor
-```
-
-Flash the same binary to all boards — each identifies itself by its hardware MAC address.
-
 ---
 
 ## Key Design Decisions
@@ -168,8 +131,6 @@ Flash the same binary to all boards — each identifies itself by its hardware M
 **Packed structs for on-wire format** — `__attribute__((packed))` ensures no compiler padding corrupts the byte layout between nodes compiled with different settings.
 
 **Dedup before routing** — duplicate packets are dropped before any routing decision is made, preventing the routing table from being updated with stale data from re-broadcasts.
-
-**ACKs bypass dedup** — ACK packets are processed before the dedup check. Without this, a retransmitted packet's ACK would be dropped as a duplicate, causing the sender to exhaust all retries even on a working link.
 
 **Split horizon** — nodes never advertise a route back to the neighbor they learned it from, preventing the count-to-infinity problem in distance-vector routing.
 
