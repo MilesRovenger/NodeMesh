@@ -6,7 +6,7 @@ A simple custom mesh networking stack built from scratch in C on ESP32 using ESP
 
 ## Demo
 
-![Three meshes connected](readme_images/three.png)
+![Three meshes connected](readme_images/three.jpeg)
 
 ---
 
@@ -24,7 +24,7 @@ ESP32 G21  →  OLED SDA
 ESP32 G22  →  OLED SCL
 ```
 
-![Single OLED wiring](readme_images/single.png)
+![Single OLED wiring](readme_images/single.jpeg)
 
 ---
 
